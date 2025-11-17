@@ -1,9 +1,16 @@
 #include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/imu.hpp>
+#include <sensor_msgs/msg/image.hpp>
+#include <std_msgs/msg/int32.hpp>
+
 #include <thread>
 #include <atomic>
 #include <chrono>
 #include "sensor_fusion_mt/safe_queue.hpp"
 #include <map>
+#include <mutex>
+#include <limits>
+#include <cmath>
 
 
 using namespace std::chrono_literals;
@@ -16,7 +23,7 @@ struct ImuData
 
 struct EncoderData
 {
-    int ticks;
+    int32_t ticks=0;
     rclcpp::Time timestamp;
 };
 
@@ -34,29 +41,82 @@ public:
     {
 
         RCLCPP_INFO(this->get_logger(), "Sensor Fusion Node has been started....");
-        imu_thread_ = std::thread(&SensorFusionNode::imuLoop, this);
-        encoder_thread_ = std::thread(&SensorFusionNode::encoderLoop, this);
-        camera_thread_ = std::thread(&SensorFusionNode::cameraLoop, this);
 
+        imu_cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        encoder_cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        camera_cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+
+        rclcpp::SubscriptionOptions imu_sub_options;
+        imu_sub_options.callback_group = imu_cb_group_;
+        imu_subscription_ = this->create_subscription<sensor_msgs::msg::Imu>(
+            "/imu/data",
+            rclcpp::SystemDefaultsQoS(),
+            std::bind(&SensorFusionNode::imuCallback, this, std::placeholders::_1),
+            imu_sub_options
+        );
+        
+        rclcpp::SubscriptionOptions encoder_sub_options;
+        encoder_sub_options.callback_group = encoder_cb_group_;
+        encoder_subscription_ = this->create_subscription<std_msgs::msg::Int32>(
+            "/encoder/ticks",
+            rclcpp::SystemDefaultsQoS(),
+            std::bind(&SensorFusionNode::encoderCallback, this, std::placeholders::_1),
+            encoder_sub_options
+        );
+
+        rclcpp::SubscriptionOptions camera_sub_options;
+        camera_sub_options.callback_group = camera_cb_group_;
+        camera_subscription_ = this->create_subscription<sensor_msgs::msg::Image>(
+            "/camera/image_raw",
+            rclcpp::SystemDefaultsQoS(),
+            std::bind(&SensorFusionNode::cameraCallback, this, std::placeholders::_1),
+            camera_sub_options
+        );
+
+
+        // Start fusion thread
         fusion_thread_ = std::thread(&SensorFusionNode::fusionLoop, this);
+
+
+        // imu_thread_ = std::thread(&SensorFusionNode::imuLoop, this);
+        // encoder_thread_ = std::thread(&SensorFusionNode::encoderLoop, this);
+        // camera_thread_ = std::thread(&SensorFusionNode::cameraLoop, this);
+
+        // fusion_thread_ = std::thread(&SensorFusionNode::fusionLoop, this);
 
     }
 
     ~SensorFusionNode()
     {
         running_ = false;
-        if (imu_thread_.joinable()) imu_thread_.join();
-        if (encoder_thread_.joinable()) encoder_thread_.join();
-        if (camera_thread_.joinable()) camera_thread_.join();
+        // if (imu_thread_.joinable()) imu_thread_.join();
+        // if (encoder_thread_.joinable()) encoder_thread_.join();
+        // if (camera_thread_.joinable()) camera_thread_.join();
         if (fusion_thread_.joinable()) fusion_thread_.join();
         RCLCPP_INFO(this->get_logger(), "Sensor Fusion Node has been stopped.");
     }
 
+
+    std::vector<rclcpp::CallbackGroup::SharedPtr> getCallbackGroups() {
+        return {imu_cb_group_, encoder_cb_group_, camera_cb_group_};
+    }
+
 private:
+
+    rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_subscription_;
+    rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr encoder_subscription_;
+    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr camera_subscription_;
+
+    rclcpp::CallbackGroup::SharedPtr imu_cb_group_;
+    rclcpp::CallbackGroup::SharedPtr encoder_cb_group_;
+    rclcpp::CallbackGroup::SharedPtr camera_cb_group_;
+
+
+
     std::atomic<bool> running_;
-    std::thread imu_thread_;
-    std::thread encoder_thread_;
-    std::thread camera_thread_;
+    // std::thread imu_thread_;
+    // std::thread encoder_thread_;
+    // std::thread camera_thread_;
     std::thread fusion_thread_;
 
 
@@ -68,60 +128,47 @@ private:
     std::map<int64_t, EncoderData> encoder_buffer_;
     std::map<int64_t, CameraData> camera_buffer_;
 
-    std::mutex imu_mutex_;
-    std::mutex encoder_mutex_;
-    std::mutex camera_mutex_;
+    mutable std::mutex imu_mutex_;
+    mutable std::mutex encoder_mutex_;
+    mutable std::mutex camera_mutex_;
 
 
 
-    void imuLoop()
+    void imuCallback(const sensor_msgs::msg::Imu::SharedPtr msg)
     {
-        rclcpp::Rate rate(100); // 100 Hz
-        while (rclcpp::ok() && running_)
-        {
-
-            ImuData data;
-            data.ax = 0.1; data.ay = 0.2; data.az = 9.81;
-            data.timestamp = this->now();
-            int64_t stamp_ns = data.timestamp.nanoseconds();
-            imu_queue_.insert_and_cleanup(imu_buffer_, imu_mutex_, data, stamp_ns);
-            rate.sleep();   
-        }       
+        ImuData data;
+        data.ax = msg->linear_acceleration.x;
+        data.ay = msg->linear_acceleration.y;
+        data.az = msg->linear_acceleration.z;
+        data.timestamp = msg->header.stamp;
+        int64_t stamp_ns = data.timestamp.nanoseconds();    
+        imu_queue_.insert_and_cleanup(imu_buffer_, imu_mutex_, data, stamp_ns); 
         
     }
 
-    void encoderLoop()
+    void encoderCallback(const std_msgs::msg::Int32::SharedPtr msg)
     {
-        rclcpp::Rate rate(50); // 50 Hz
-        int tick = 0;
-        while (rclcpp::ok() && running_)
-        {
-            EncoderData data;
-            data.ticks = tick++;
-            data.timestamp = this->now();
-            int64_t stamp_ns = data.timestamp.nanoseconds();
-            encoder_queue_.insert_and_cleanup(encoder_buffer_, encoder_mutex_, data, stamp_ns);
-            rate.sleep();
-        }    
+        EncoderData data;  
+        data.ticks = msg->data;
+        data.timestamp = this->now();
+        int64_t stamp_ns = data.timestamp.nanoseconds();
+        encoder_queue_.insert_and_cleanup(encoder_buffer_, encoder_mutex_, data, stamp_ns);
+
         
 
     }
 
 
-    void cameraLoop()
+    void cameraCallback(const sensor_msgs::msg::Image::SharedPtr msg)
     {
-        rclcpp::Rate rate(30); // 30 Hz
-        while (rclcpp::ok() && running_)
-        {
-            CameraData data;
-            data.timestamp = this->now();
-            int64_t stamp_ns = data.timestamp.nanoseconds();
-            camera_queue_.insert_and_cleanup(camera_buffer_, camera_mutex_, data, stamp_ns);
-            rate.sleep();
-         
-        }    
+        CameraData data;  
+        data.timestamp = msg->header.stamp;
+        int64_t stamp_ns = data.timestamp.nanoseconds();
+        camera_queue_.insert_and_cleanup(camera_buffer_, camera_mutex_, data, stamp_ns); 
         
     }
+
+
 
     void fusionLoop()
     {
@@ -159,17 +206,18 @@ private:
                 }
             }
 
+            // at this point, we have cam, imu, and enc data synchronized
+            double imu_dt_ms = double(imu.timestamp.nanoseconds() - cam_ts) / 1e6;
+            double enc_dt_ms = double(enc.timestamp.nanoseconds() - cam_ts) / 1e6;
 
-                RCLCPP_INFO(this->get_logger(),
-                "\n=== FUSED ===\n"
-                "Camera: %ld\n"
-                "IMU   : ax=%.2f ay=%.2f az=%.2f (dt=%.2f ms)\n"
-                "Enc   : ticks=%d (dt=%.2f ms)\n",
+
+            RCLCPP_INFO(this->get_logger(),
+                "FUSED: cam_ts=%ld imu_dt=%.3fms enc_dt=%.3fms imu(ax,ay,az)=%.3f,%.3f,%.3f enc_ticks=%d",
                 cam_ts,
+                imu_dt_ms,
+                enc_dt_ms,
                 imu.ax, imu.ay, imu.az,
-                (imu.timestamp.nanoseconds() - cam_ts) / 1e6,
-                enc.ticks,
-                (enc.timestamp.nanoseconds() - cam_ts) / 1e6
+                enc.ticks
             );
 
             rate.sleep();
@@ -184,7 +232,12 @@ int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<SensorFusionNode>();
-    rclcpp::spin(node);
+    rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 4);
+    for (const auto& cb_group : node->getCallbackGroups()) {
+        executor.add_callback_group(cb_group, node->get_node_base_interface());
+    }
+    executor.add_node(node);
+    executor.spin();
     rclcpp::shutdown();
     return 0;
 }

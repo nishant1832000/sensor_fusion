@@ -1,0 +1,18 @@
+<?xml version="1.0" ?>
+<sdf version="1.9">
+  <world name="default">
+    <include>
+      <uri>model://sun</uri>
+    </include>
+
+    <include>
+      <uri>model://ground_plane</uri>
+    </include>
+
+    <!-- spawn our robot -->
+    <include>
+      <uri>model://simple_diff_robot</uri>
+      <pose>0 0 0 0 0 0</pose>
+    </include>
+  </world>
+</sdf>

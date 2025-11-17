@@ -8,10 +8,32 @@ endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(std_msgs)
+find_package(robot_state_publisher REQUIRED)
+find_package(xacro REQUIRED)
+find_package(ros_gz_sim REQUIRED)
+
 include_directories(include)
 
+install(
+  DIRECTORY launch
+  DESTINATION share/${PROJECT_NAME}
+)
+
+install(
+  DIRECTORY worlds
+  DESTINATION share/${PROJECT_NAME}
+)
+
+# Install models (URDF/Xacro)
+install(
+  DIRECTORY models
+  DESTINATION share/${PROJECT_NAME}
+)
+
 add_executable(sensor_fusion_node src/sensor_fusion_node.cpp)
-ament_target_dependencies(sensor_fusion_node rclcpp)
+ament_target_dependencies(sensor_fusion_node rclcpp sensor_msgs std_msgs)
 
 install(TARGETS sensor_fusion_node DESTINATION lib/${PROJECT_NAME})
 
